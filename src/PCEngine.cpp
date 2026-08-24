@@ -2,7 +2,14 @@
 
 void PCEngine::init() {
     bus.connect(&cartridge);
+    bus.connect(&vdc);
+    bus.connect(&vce);
+    bus.connect(&psg);
+    bus.connect(&timer);
+    bus.connect(&joypad);
+    bus.connect(&irqController);
     cpu.connect(&bus);
+    cpu.connect(&irqController);
     vdc.connect(&bus);
 }
 
@@ -16,6 +23,9 @@ void PCEngine::reset() {
     vdc.reset();
     vce.reset();
     psg.reset();
+    timer.reset();
+    joypad.reset();
+    irqController.reset();
 }
 
 bool PCEngine::loadRom(const uint8_t* data, size_t len) {

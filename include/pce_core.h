@@ -33,24 +33,134 @@ private:
     std::vector<uint8_t> rom;
 };
 
+// ── Timer ────────────────────────────────────────────────────────────────
+// Built into the HuC6280. One 7-bit down-counter clocked at a fixed
+// divider off the CPU clock; reload value and start/stop are the only two
+// registers. On underflow it reloads and requests an IRQ (routed through
+// IrqController). Register layout below is best-effort pending doc
+// cross-check — flagging rather than asserting confidence:
+//   $0C00 write: reload value (7-bit)   read: live counter value (7-bit)
+//   $0C01 write: bit0 = start(1)/stop(0)
+class Timer {
+public:
+    void reset();
+    // advance by `cpuCycles` CPU cycles; returns true the instant it
+    // underflows (caller wires that into IrqController)
+    bool tick(u32 cpuCycles);
+
+    uint8_t readRegister(u16 offset);
+    void writeRegister(u16 offset, uint8_t val);
+
+private:
+    uint8_t reloadValue = 0;
+    uint8_t counter = 0;
+    bool running = false;
+    u32 cycleAccum = 0;
+    static constexpr u32 kDivider = 1024;   // TODO: verify against docs
+};
+
+// ── Joypad ───────────────────────────────────────────────────────────────
+// Standard 2-button PCE pad, read through a single latched register.
+//   $1000 write: bit1 = SEL (selects which 4-bit nibble is read next),
+//                bit0 = CLR (resets multitap device counter)
+//        read:  low nibble = button state for the currently selected half
+// Multitap (up to 5 pads) not modeled yet — single pad on port 0 only.
+class Joypad {
+public:
+    void reset();
+    void setButton(uint8_t index, bool pressed);   // index matches DingInputDescriptor
+
+    uint8_t readRegister(u16 offset);
+    void writeRegister(u16 offset, uint8_t val);
+
+private:
+    uint16_t buttonState = 0xFFFF;   // active-low, all released
+    bool selectHigh = false;
+};
+
+// ── IrqController ────────────────────────────────────────────────────────
+// Interrupt disable + request registers. Priority order TIQ > IRQ1 > IRQ2
+// per HuC6280 convention (matches HuC6280::handleIrqIfPending's vector
+// selection, though those vector addresses themselves are still flagged
+// unverified there).
+//   $1402: interrupt disable — bit0=IRQ2 bit1=IRQ1 bit2=TIQ (1 = masked)
+//   $1403: interrupt request — read: pending flags; write: acks timer IRQ
+class IrqController {
+public:
+    void reset();
+    void setLine(int which, bool asserted);   // 0=IRQ2 1=IRQ1 2=TIQ
+    bool pending(int which) const;
+
+    uint8_t readRegister(u16 offset);
+    void writeRegister(u16 offset, uint8_t val);
+
+private:
+    uint8_t disableMask = 0;
+    bool lines[3] = {};   // raw asserted state per line, pre-mask
+};
+
+class VDC;
+class VCE;
+class PSG;
+
 // ── Bus ──────────────────────────────────────────────────────────────────
-// Central memory bus: routes CPU reads/writes across ROM, 8KB work RAM,
-// and MMIO windows (VDC/VCE/PSG/timer/IRQ/joypad ports) via the HuC6280's
-// MPR (memory mapping register) banking — 8 windows of 8KB each mapping
-// into a 21-bit address space.
+// Central memory bus. The HuC6280 sees a 16-bit address space (64KB) split
+// into 8 pages of 8KB each — the top 3 bits of the address (bits 13-15)
+// select an MPR (Memory Mapping Register), and each MPR holds an 8-bit
+// bank number that selects an 8KB window into the real 21-bit (2MB)
+// physical address space. CPU sets MPRs via TAM/TMA (not yet implemented
+// on the CPU side — Bus exposes readMPR/writeMPR for when that lands).
+//
+// Physical bank map (standard PCE, no CD/System Card):
+//   $00-$7F  ROM (HuCard) — mirrored/wrapped if the cart is smaller than
+//            the full 1MB (0x80 banks) this range implies
+//   $F8      Work RAM (8KB) — only bank that's actually backed by real RAM
+//   $F7      Battery-backed RAM on carts that have it (not yet modeled)
+//   $FF      Hardware page — VDC/VCE/PSG/timer/joypad/IRQ registers
+//   anything else: open bus, reads as 0xFF for now
 class Bus {
 public:
     void connect(Cartridge* cart);
+    void connect(VDC* vdc);
+    void connect(VCE* vce);
+    void connect(PSG* psg);
+    void connect(Timer* timer);
+    void connect(Joypad* joypad);
+    void connect(IrqController* irq);
 
     uint8_t read(u32 addr);
     void write(u32 addr, uint8_t val);
 
     void reset();
 
+    // Advance timer by cpuCycles and route an underflow into the IRQ
+    // controller as a TIQ. Called from HuC6280::runFrame() per step.
+    void tickTimer(u32 cpuCycles);
+
+    // MPR access — CPU's TAM/TMA opcodes will call these once implemented.
+    // index is 0-7 (one per 8KB page of CPU address space).
+    uint8_t readMPR(uint8_t index) const;
+    void writeMPR(uint8_t index, uint8_t bank);
+
 private:
-    Cartridge* cartridge = nullptr;
-    uint8_t wram[0x2000] = {};   // 8KB internal work RAM
+    Cartridge*     cartridge = nullptr;
+    VDC*           vdc = nullptr;
+    VCE*           vce = nullptr;
+    PSG*           psg = nullptr;
+    Timer*         timer = nullptr;
+    Joypad*        joypad = nullptr;
+    IrqController* irqController = nullptr;
+
+    uint8_t wram[0x2000] = {};   // 8KB internal work RAM (physical bank $F8)
     uint8_t mpr[8] = {};         // memory mapping registers (bank select)
+
+    // Physical bank + 13-bit offset a CPU address resolves to under the
+    // current MPR mapping.
+    struct PhysAddr { uint8_t bank; u16 offset; };
+    PhysAddr resolve(u32 cpuAddr) const;
+
+    uint8_t readHardwarePage(u16 offset);
+    void writeHardwarePage(u16 offset, uint8_t val);
 };
 
 // ── HuC6280 ──────────────────────────────────────────────────────────────
@@ -59,50 +169,202 @@ private:
 // interrupt controller (IRQ1/IRQ2/TIQ priority + mask register).
 class HuC6280 {
 public:
+    // Status flag bits (standard 6502 layout)
+    enum Flag : u8 {
+        FLAG_C = 0x01,  // carry
+        FLAG_Z = 0x02,  // zero
+        FLAG_I = 0x04,  // IRQ disable
+        FLAG_D = 0x08,  // decimal mode
+        FLAG_B = 0x10,  // break
+        FLAG_T = 0x20,  // unused on NMOS 6502; HuC6280 reserves as 1
+        FLAG_V = 0x40,  // overflow
+        FLAG_N = 0x80,  // negative
+    };
+
     void connect(Bus* bus);
+    void connect(IrqController* irq);
     void reset();
-    void step();   // execute one instruction
+    void step();   // execute one instruction, returns via cycles accumulator
     void runFrame();
+
+    void nmi();
 
     // diagnostics
     size_t dumpState(char* buf, size_t buf_size) const;
 
 private:
     Bus* bus = nullptr;
+    IrqController* irqController = nullptr;
 
     u8  a = 0, x = 0, y = 0, s = 0xFF;
     u16 pc = 0;
-    u8  p = 0;      // status flags
-    u8  speed = 0;  // HuC6280 has a CPU speed register (1.79MHz / 7.16MHz)
+    u8  p = FLAG_T | FLAG_I;   // status flags — IRQ disabled + reserved bit set on reset
+    u8  speed = 0;             // CPU speed register: 0 = 1.79MHz, 1 = 7.16MHz
+
+    u64 cycles = 0;
+
+    // ── memory helpers ──
+    u8  fetch8();
+    u16 fetch16();
+    u8  read8(u16 addr);
+    void write8(u16 addr, u8 val);
+    void push8(u8 val);
+    u8  pop8();
+    void push16(u16 val);
+    u16 pop16();
+
+    // ── flag helpers ──
+    void setZN(u8 val);
+    void setFlag(Flag f, bool on);
+    bool getFlag(Flag f) const { return (p & f) != 0; }
+
+    // ── addressing modes ──
+    // Each returns the effective address; accumulator/implied modes are
+    // handled directly in the opcode body since they need no address.
+    u16 addrZeroPage();
+    u16 addrZeroPageX();
+    u16 addrZeroPageY();
+    u16 addrAbsolute();
+    u16 addrAbsoluteX();
+    u16 addrAbsoluteY();
+    u16 addrIndirect();
+    u16 addrIndexedIndirect();   // (zp,X)
+    u16 addrIndirectIndexed();   // (zp),Y
+    u16 addrZeroPageIndirect();  // (zp) — HuC6280 addition, no 6502 equivalent
+    s8  addrRelative();
+
+    // ── dispatch ──
+    void execute(u8 opcode);
+    void handleIrqIfPending();
+
+    // HuC6280-specific block transfer instructions (TAI/TIA/TII/TIN/TDD).
+    // All six take a 6-byte operand (src lo/hi, dst lo/hi, len lo/hi) and,
+    // in this implementation, execute the whole transfer atomically rather
+    // than being interruptible mid-copy like real hardware — fine for
+    // correctness, will matter if a game relies on IRQs firing mid-block.
+    enum class BlockMode { IncInc, DecDec, IncFixed, AltInc, IncAlt };
+    void blockTransfer(BlockMode mode);
+
+    // TODO(next step): TST immediate/zp/abs variants — opcode encodings
+    // need cross-checking against a real HuC6280 reference before wiring,
+    // didn't want to guess and risk silently wrong flag behavior.
 };
 
 // ── VDC ──────────────────────────────────────────────────────────────────
-// Video Display Controller (HuC6270). Handles BG plane, sprites, VRAM
-// (separate 64KB address space from CPU-visible memory), and generates
-// the raw pixel stream that VCE turns into color output.
+// Video Display Controller (HuC6270). Register access protocol and full
+// register set CONFIRMED via HuC6270 Video Display Controller Manual
+// (project file):
+//   - AR (address register) / SR (status register) live at A1=0 (offset
+//     bit1==0): AR is write-only (selects R00-R13), SR is read-only.
+//   - All other registers (R00-R13) live at A1=1, split into low byte
+//     (A0=0) and high byte (A0=1). Writing the high byte commits the
+//     16-bit value and triggers that register's side effect (VRAM
+//     read/write, block transfer start, etc).
+//   - VRAM is word-addressable (16-bit words), up to 64K words per the
+//     block transfer length register's stated max — allocated in full
+//     here rather than guessing a smaller real hardware size, since a
+//     too-small buffer risks silent wraparound bugs.
 class VDC {
 public:
     void connect(Bus* bus);
     void reset();
     void runLine();   // render one scanline's worth of state
 
+    // CPU-facing register access — see class comment for A0/A1 protocol.
+    uint8_t readRegister(u16 offset);
+    void writeRegister(u16 offset, uint8_t val);
+
     size_t dumpState(char* buf, size_t buf_size) const;
 
 private:
     Bus* bus = nullptr;
-    uint8_t vram[0x10000] = {};  // 64KB VRAM, VDC-local
+
+    static constexpr size_t kVramWords = 0x10000;
+    u16 vram[kVramWords] = {};
+
+    // Internal register file. Indices match the R00-R13 numbering from
+    // the manual's register list (R03/R04 reserved, unused).
+    enum RegIndex {
+        REG_MAWR = 0x00, REG_MARR = 0x01, REG_VWR_VRR = 0x02,
+        REG_CR   = 0x05, REG_RCR  = 0x06, REG_BXR = 0x07, REG_BYR = 0x08,
+        REG_MWR  = 0x09, REG_HSR  = 0x0A, REG_HDR = 0x0B, REG_VPR = 0x0C,
+        REG_VDR  = 0x0D, REG_VCR  = 0x0E, REG_DCR = 0x0F, REG_SOUR = 0x10,
+        REG_DESR = 0x11, REG_LENR = 0x12, REG_DVSSR = 0x13,
+    };
+    u16 regs[0x14] = {};
+    u16 vrrValue = 0;   // separate from regs[REG_VWR_VRR] since VWR (write)
+                         // and VRR (read) share a register number but are
+                         // logically distinct per the manual
+
+    u8 ar = 0;   // address register — selects which of regs[]/vrrValue
+                 // the next data-area access targets
+
+    // Status register bits (SR) — CONFIRMED bit layout: bit0=CR(collision),
+    // bit1=OR(over), bit2=RR(scanline match), bit3=DS(SATB transfer end),
+    // bit4=DV(VRAM-VRAM transfer end), bit5=VD(vblank), bit6=BSY.
+    // Cleared on read except BSY, per the manual.
+    bool statusCollision = false;
+    bool statusOver = false;
+    bool statusScanlineMatch = false;
+    bool statusSatbEnd = false;
+    bool statusVramEnd = false;
+    bool statusVblank = false;
+    bool statusBusy = false;
+
+    void onHighByteWritten(u8 regIndex);
+    void incrementAddress(u16& addr);   // applies IW field from CR
+    void doVramToVramBlockTransfer();
+
+    // TODO(next step): actual background/sprite pixel generation.
+    // runLine() currently advances no rendering state — register access
+    // and VRAM/block-transfer plumbing is real, but nothing reads BAT/CG/
+    // SAT/SG to produce pixels yet. That's the next VDC pass.
 };
 
 // ── VCE ──────────────────────────────────────────────────────────────────
-// Video Color Encoder (HuC6260). Palette RAM (512 entries, 9-bit color) →
-// RGB output. Sits between VDC and the framebuffer.
+// Video Color Encoder (HuC6260). Register access protocol and color table
+// layout CONFIRMED via HuC6260 Video Color Encoder Manual (project file):
+//   - CR/CTA live at A2=0 (A1 selects CR vs CTA); CTW/CTR live at A2=1
+//     (direction-based, same address bits, write vs read like VDC's
+//     VWR/VRR pair). All registers use the same A0=0(low)/A0=1(high)
+//     byte-split convention as the VDC.
+//   - Color table is 512 entries x 9 bits (G:3 R:3 B:3). Each entry's
+//     low byte holds G[1:0]/R[2:0]/B[2:0], high byte holds only G[2]
+//     in bit 0 — the rest of the high byte is unused per the manual's
+//     shaded-region diagram.
+//   - CTA is a 9-bit address into the color table; writing CTW's high
+//     byte commits the entry and auto-increments CTA. Reading CTR's
+//     high byte likewise auto-increments CTA (confirmed §2.2.2(3)(b)).
+//   - Palette addressing: VD8 selects background(0)/sprite(1) half
+//     (256 entries each), VD7-VD4 select a 16-entry color block, VD3-VD0
+//     select the pattern color within that block — this is how VDC pixel
+//     output will eventually index into this table once VDC rendering
+//     exists.
 class VCE {
 public:
     void reset();
     void writeFramebuffer(uint8_t* fb, uint32_t width, uint32_t height);
 
+    // CPU-facing register access — see class comment for A0/A1/A2 protocol.
+    uint8_t readRegister(u16 offset);
+    void writeRegister(u16 offset, uint8_t val);
+
+    // Resolves a 9-bit VDC video code (VD0-VD8, see manual §2.2.2(2)) to
+    // a 9-bit GRB color table entry. Used once VDC rendering exists.
+    u16 resolveColor(u16 vd0to8) const { return colorTable[vd0to8 & 0x1FF]; }
+
 private:
-    uint16_t palette[512] = {};  // 9-bit color values
+    static constexpr size_t kColorTableSize = 512;
+    u16 colorTable[kColorTableSize] = {};   // each entry: bits 8-6=G, 5-3=R, 2-0=B
+
+    u16 cr = 0;    // control register — DCC field (bits 0-1), clock divider select
+    u16 cta = 0;   // color table address (9 bits meaningful)
+
+    // Latches for the in-progress low/high byte write to CTW, since the
+    // 9-bit value only commits on the high-byte write.
+    u8 ctwLowLatch = 0;
+
+    void commitColorWrite(u8 highByte);
 };
 
 // ── PSG ──────────────────────────────────────────────────────────────────
@@ -113,6 +375,11 @@ public:
     void reset();
     void runFrame();
     uint32_t readSamples(float* buf, uint32_t count);
+
+    // CPU-facing register access, mapped at physical bank $FF, offset
+    // $0800-$0BFF (channel select, volume, waveform, frequency, LFO/noise).
+    uint8_t readRegister(u16 offset);
+    void writeRegister(u16 offset, uint8_t val);
 
 private:
     uint32_t sampleCount = 0;
@@ -130,12 +397,15 @@ public:
 
     bool loadRom(const uint8_t* data, size_t len);
 
-    Cartridge cartridge;
-    Bus       bus;
-    HuC6280   cpu;
-    VDC       vdc;
-    VCE       vce;
-    PSG       psg;
+    Cartridge     cartridge;
+    Bus           bus;
+    HuC6280       cpu;
+    VDC           vdc;
+    VCE           vce;
+    PSG           psg;
+    Timer         timer;
+    Joypad        joypad;
+    IrqController irqController;
 };
 
 #endif // PCE_CORE_H

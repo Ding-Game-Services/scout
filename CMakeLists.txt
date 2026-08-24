@@ -66,6 +66,9 @@ set(CORE_SOURCES
     src/VDC.cpp
     src/VCE.cpp
     src/PSG.cpp
+    src/Timer.cpp
+    src/Joypad.cpp
+    src/IrqController.cpp
     src/PCEngine.cpp
     src/ding_core_pce.cpp
 )

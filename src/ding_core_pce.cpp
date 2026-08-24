@@ -200,10 +200,8 @@ uint32_t ding_read_audio_samples(float* buf, uint32_t count) {
 // ── Input ────────────────────────────────────────────────────────────────
 
 void ding_set_button(uint8_t port, uint8_t index, uint8_t pressed) {
-    (void)port;
-    (void)index;
-    (void)pressed;
-    // TODO: wire to joypad MMIO port once Bus dispatch is real
+    (void)port;   // single pad only for now — multitap not modeled
+    g_engine.joypad.setButton(index, pressed != 0);
 }
 
 void ding_set_axis(uint8_t port, uint8_t index, int16_t value) {
