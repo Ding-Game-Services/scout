@@ -11,6 +11,7 @@ void PCEngine::init() {
     cpu.connect(&bus);
     cpu.connect(&irqController);
     vdc.connect(&bus);
+    vdc.connect(&irqController);
 }
 
 void PCEngine::destroy() {
@@ -34,9 +35,11 @@ bool PCEngine::loadRom(const uint8_t* data, size_t len) {
 
 void PCEngine::runFrame() {
     // TODO: real timing loop interleaving cpu.step()/vdc.runLine() per
-    // scanline. Placeholder just drives one frame's worth of stub calls.
+    // scanline (currently CPU and VDC run as separate flat passes, not
+    // interleaved cycle-by-cycle) — and real NTSC line count (262/263
+    // total including vblank) instead of just the visible area.
     cpu.runFrame();
-    for (int line = 0; line < 263; ++line) {
+    for (int line = 0; line < vdc.getVisibleHeight(); ++line) {
         vdc.runLine();
     }
     psg.runFrame();

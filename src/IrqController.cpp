@@ -1,7 +1,10 @@
 /*
  * IrqController.cpp — interrupt disable + request registers
  *
- * CONFIRMED via Hardware Manual §2.4.4-2.4.5 (Fig 2-4-2/2-4-3):
+ * CONFIRMED via Hardware Manual §2.4.4-2.4.5 (Fig 2-4-2/2-4-3), and
+ * independently re-confirmed via PCE_CPU_Hardware_Documentation.htm
+ * (project file, exact same bit0=IRQ2/bit1=IRQ1/bit2=TIMER layout and
+ * "write to $1403 acknowledges the TIMER interrupt" behavior):
  *   - bit0 = IRQ2, bit1 = IRQ1, bit2 = TIQ — same order in both the
  *     disable register and the request register
  *   - disable register at (A1,A0)=(1,0) -> offset $02 within hardware page

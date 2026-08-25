@@ -1,7 +1,11 @@
 /*
  * VDC.cpp — HuC6270 register access + VRAM interface
  *
- * CONFIRMED via HuC6270 Video Display Controller Manual (project file):
+ * CONFIRMED via HuC6270 Video Display Controller Manual (project file)
+ * and cross-checked against PCE_Hardware_Documentation.htm (community
+ * reference, project file — matched on every point of overlap: register
+ * numbering, auto-increment table, DCR bit layout, LENR-high-byte DMA
+ * trigger, SCREEN size table):
  *   - §2.1.1/2.5: AR/SR at A1=0; data registers at A1=1, low byte A0=0,
  *     high byte A0=1, high-byte write commits and triggers side effects.
  *   - §2.1.3(1): AR=0x04 is explicitly documented as invalid — don't set it.
@@ -15,9 +19,20 @@
  *     SI/D and DI/D bits, length "M-1" encoding.
  *   - §2.1.3(2): Status register bit layout and read-clears-except-BSY
  *     behavior.
+ *   - VDC interrupts route through IRQ1 — confirmed via HuC62 Tech
+ *     Notes' irq1_handle example. Now wired: VRAM-VRAM and VRAM-SATB
+ *     transfer completion assert IRQ1 through IrqController, gated by
+ *     DCR's DVC/DSC enable bits (confirmed identically in both the
+ *     official manual and PCE_Hardware_Documentation.htm). Reading SR
+ *     drops the line again, matching its clear-on-read behavior.
  *
  * NOT implemented this pass (flagged in pce_core.h):
  *   - Actual background/sprite pixel generation (runLine is a no-op)
+ *   - Collision and scanline-match interrupts aren't wired yet — they
+ *     depend on real sprite/scanline logic that doesn't exist until the
+ *     rendering pass lands. Only the two DMA-completion interrupts are
+ *     live right now, since those are the only status conditions
+ *     anything currently sets.
  *   - VRAM-SATB block transfer (DVSSR) — register write is accepted and
  *     sets statusSatbEnd on the *next* call for now, but doesn't actually
  *     move data anywhere since SATB storage doesn't exist yet (that's
@@ -42,6 +57,10 @@ void VDC::connect(Bus* b) {
     bus = b;
 }
 
+void VDC::connect(IrqController* irq) {
+    irqController = irq;
+}
+
 void VDC::reset() {
     std::memset(vram, 0, sizeof(vram));
     std::memset(regs, 0, sizeof(regs));
@@ -52,7 +71,85 @@ void VDC::reset() {
 }
 
 void VDC::runLine() {
-    // TODO: BG plane + sprite rendering per scanline — see class comment.
+    renderBackgroundLine(currentLine);
+    currentLine++;
+    if (currentLine >= kVisibleHeight) currentLine = 0;
+}
+
+// ── background rendering ────────────────────────────────────────────────
+// CONFIRMED tile layout via VDC Manual §2.3.2/2.3.3:
+//   - BAT entry (one word per character cell, 32x32-cell virtual screen,
+//     top-left = VRAM address 0): bits 15-12 = CG COLOR (4-bit block),
+//     bits 11-0 = character code.
+//   - Character data lives at VRAM word address (character_code * 16).
+//     Per scanline row (0-7) within the 8x8 character:
+//       word at (charBase + row)     holds CH0 in the low byte, CH1 in
+//                                     the high byte (confirmed via the
+//                                     manual's Fig ② "CH1,CH0" fetch)
+//       word at (charBase + 8 + row) holds CH2 in the low byte, CH3 in
+//                                     the high byte (Fig ③ "CH3,CH2")
+//     Each pixel's 4-bit color = CH3:CH2:CH1:CH0 (CH3 is the MSB), per
+//     §2.3.5's "VD3-VD0 = each bit of CH3-CH0" video-output table.
+//   - Bit-within-byte -> x-position mapping (MSB = leftmost pixel) is
+//     the conventional interpretation but not spelled out pixel-by-pixel
+//     in the manual's diagrams — flagging this specific detail as the
+//     one part of this function that could be backwards pending a real
+//     test-ROM comparison.
+//
+// NOT implemented this pass: sprites, 4-color BG mode, SCREEN sizes
+// other than 32x32, and the CG COLOR block correctly offsetting into
+// VCE's *background* half of the color table (currently assumed to
+// start at color-table index 0 — matches the background half per VCE
+// manual §2.2.1, so this one should already be correct).
+void VDC::renderBackgroundLine(int line) {
+    if (!bus) return;
+
+    // Virtual screen is fixed at 32x32 characters (SCREEN=0) for now.
+    constexpr int kVirtualCharsX = 32;
+    constexpr int kVirtualPixelsX = kVirtualCharsX * 8;   // 256
+    constexpr int kVirtualPixelsY = kVirtualCharsX * 8;   // 256 (32 rows too)
+
+    int scrollX = regs[REG_BXR] % kVirtualPixelsX;
+    int scrollY = regs[REG_BYR] % kVirtualPixelsY;
+    int srcY = (line + scrollY) % kVirtualPixelsY;
+    int charRow = srcY / 8;
+    int rowInChar = srcY % 8;
+
+    for (int x = 0; x < kVisibleWidth; x++) {
+        int srcX = (x + scrollX) % kVirtualPixelsX;
+        int charCol = srcX / 8;
+        int colInChar = srcX % 8;
+
+        u16 batAddr = static_cast<u16>(charRow * kVirtualCharsX + charCol);
+        u16 batEntry = vram[batAddr & (kVramWords - 1)];
+        u16 charCode = batEntry & 0x0FFF;
+        u8 cgColor = static_cast<u8>((batEntry >> 12) & 0x0F);
+
+        u16 charBase = static_cast<u16>(charCode * 16);
+        u16 word01 = vram[(charBase + rowInChar) & (kVramWords - 1)];
+        u16 word23 = vram[(charBase + 8 + rowInChar) & (kVramWords - 1)];
+        u8 ch0 = static_cast<u8>(word01 & 0xFF);
+        u8 ch1 = static_cast<u8>((word01 >> 8) & 0xFF);
+        u8 ch2 = static_cast<u8>(word23 & 0xFF);
+        u8 ch3 = static_cast<u8>((word23 >> 8) & 0xFF);
+
+        int bitPos = 7 - colInChar;   // MSB = leftmost pixel (flagged above)
+        u8 pixel = static_cast<u8>(
+            ((ch0 >> bitPos) & 1)       |
+            (((ch1 >> bitPos) & 1) << 1) |
+            (((ch2 >> bitPos) & 1) << 2) |
+            (((ch3 >> bitPos) & 1) << 3));
+
+        // Video code per §2.3.5: VD8=0(background), VD7-4=CG COLOR,
+        // VD3-0=pixel pattern bits. CONFIRMED special case: when the
+        // pattern is 0, VD7-4 are forced to 0 regardless of CG COLOR —
+        // this is what makes pattern-0 always resolve to the universal
+        // background color (block 0, color 0) instead of "block N,
+        // color 0", which would otherwise be a different clear color
+        // per tile.
+        u16 videoCode = (pixel == 0) ? 0 : static_cast<u16>((cgColor << 4) | pixel);
+        videoCodes[line * kVisibleWidth + x] = videoCode;
+    }
 }
 
 // ── register access ────────────────────────────────────────────────────
@@ -74,6 +171,12 @@ uint8_t VDC::readRegister(u16 offset) {
         statusCollision = statusOver = statusScanlineMatch = false;
         statusSatbEnd = statusVramEnd = statusVblank = false;
         // statusBusy intentionally left alone.
+
+        // CONFIRMED via HuC62 Tech Notes ("irq1_handle" routine): VDC
+        // interrupts route through IRQ1. All status bits clear on SR
+        // read, so drop the line too — matches the "reading SR clears
+        // status" behavior extending to the interrupt request itself.
+        if (irqController) irqController->setLine(1, false);
 
         return sr;
     }
@@ -158,11 +261,18 @@ void VDC::onHighByteWritten(u8 regIndex) {
             break;
 
         case REG_DVSSR:
-            // VRAM-SATB transfer trigger — confirmed §2.1.3(21) NOTE (b),
-            // but SATB storage itself isn't implemented yet (see file
-            // header). Just flag completion so status polling doesn't
-            // hang indefinitely; no data actually moves.
+            // VRAM-SATB transfer trigger — confirmed §2.1.3(21) NOTE (b)
+            // and independently by PCE_Hardware_Documentation.htm: real
+            // hardware defers this to the *next vertical sync* rather
+            // than firing immediately, and auto-repeats every vsync if
+            // DCR bit4 (DSR) is set. This still fires immediately since
+            // SATB storage itself isn't implemented yet (see file
+            // header) — the timing gap doesn't matter until real sprite
+            // data actually needs to land at the right moment.
             statusSatbEnd = true;
+            if ((regs[REG_DCR] & 0x01) != 0 && irqController) {   // DSC bit
+                irqController->setLine(1, true);
+            }
             break;
 
         default:
@@ -188,6 +298,13 @@ void VDC::doVramToVramBlockTransfer() {
     }
 
     statusVramEnd = true;
+
+    // CONFIRMED: DCR bit1 (DVC) gates whether transfer-complete should
+    // interrupt — same bit both official manual and PCE_Hardware_Doc
+    // agree on. Fires IRQ1 per the Tech Notes' irq1_handle convention.
+    if ((regs[REG_DCR] & 0x02) != 0 && irqController) {
+        irqController->setLine(1, true);
+    }
 }
 
 size_t VDC::dumpState(char* buf, size_t buf_size) const {

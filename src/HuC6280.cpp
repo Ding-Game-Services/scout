@@ -61,10 +61,14 @@ void HuC6280::reset() {
     speed = 0;
     cycles = 0;
 
-    // Reset vector lives at $FFFC/$FFFD, same as stock 6502.
+    // CONFIRMED via original Hardware Manual §2.1.3 (physical $1FFE/
+    // $1FFF at reset = logical $FFFE/$FFFF since MPR7=0) and
+    // independently via PCE_CPU_Hardware_Documentation.htm's vector
+    // table. BUG FIX: this previously read $FFFC, which is actually
+    // the NMI vector — the two were swapped. See HuC6280::nmi().
     if (bus) {
-        u8 lo = bus->read(0xFFFC);
-        u8 hi = bus->read(0xFFFD);
+        u8 lo = bus->read(0xFFFE);
+        u8 hi = bus->read(0xFFFF);
         pc = static_cast<u16>(lo) | (static_cast<u16>(hi) << 8);
     } else {
         pc = 0;
@@ -194,11 +198,10 @@ void HuC6280::nmi() {
     push16(pc);
     push8(p & static_cast<u8>(~FLAG_B));
     setFlag(FLAG_I, true);
-    // Derived from the confirmed BRK vector ($FFF6/$FFF7 = IRQ2/BRK):
-    // standard HuC6280 vector table is FFF6=IRQ2/BRK, FFF8=IRQ1, FFFA=TIQ,
-    // FFFC=RESET, FFFE=NMI. RESET at FFFC matches reset() already; NMI
-    // at FFFE follows the same table.
-    pc = static_cast<u16>(read8(0xFFFE)) | (static_cast<u16>(read8(0xFFFF)) << 8);
+    // CONFIRMED via PCE_CPU_Hardware_Documentation.htm's vector table:
+    // NMI is $FFFC, RESET is $FFFE. BUG FIX: this previously read
+    // $FFFE, colliding with the reset vector — see HuC6280::reset().
+    pc = static_cast<u16>(read8(0xFFFC)) | (static_cast<u16>(read8(0xFFFD)) << 8);
 }
 
 void HuC6280::handleIrqIfPending() {
@@ -216,9 +219,12 @@ void HuC6280::handleIrqIfPending() {
     push8(p & static_cast<u8>(~FLAG_B));
     setFlag(FLAG_I, true);
 
-    // Vector table confirmed via Software Manual's BRK entry (FFF6/FFF7 =
-    // IRQ2/BRK), extrapolated to the standard HuC6280 layout: FFF6=IRQ2,
-    // FFF8=IRQ1, FFFA=TIQ, FFFC=RESET, FFFE=NMI.
+    // Vector table CONFIRMED via three independent sources: Software
+    // Manual's BRK entry (FFF6/FFF7=IRQ2/BRK), original Hardware
+    // Manual §2.1.3 (RESET at physical $1FFE=logical $FFFE), and
+    // PCE_CPU_Hardware_Documentation.htm's explicit table (which also
+    // caught the reset/NMI swap bug fixed in reset()/nmi() above).
+    // Full table: FFF6=IRQ2, FFF8=IRQ1, FFFA=TIMER, FFFC=NMI, FFFE=RESET.
     u16 vector = which == 2 ? 0xFFFA
                : which == 1 ? 0xFFF8
                              : 0xFFF6;
@@ -240,10 +246,12 @@ void HuC6280::step() {
 }
 
 void HuC6280::runFrame() {
-    // Placeholder frame budget — real cycle count depends on speed
-    // register (1.79MHz vs 7.16MHz) and needs to sync against VDC scanline
-    // timing once that's real. ~29780 cycles/frame at base NTSC speed.
-    const u64 target = cycles + 29780;
+    // CONFIRMED via HuC62 Tech Notes (project file, "Displaying a Speed
+    // Gage"): "The HuC6280 runs at about 7.19 M Hertz... there are
+    // 119,904 machine cycles per VSYNC." Replaces the earlier 29780
+    // placeholder guess. Still doesn't sync against real VDC scanline
+    // timing — this is a flat per-frame budget, not scanline-accurate.
+    const u64 target = cycles + 119904;
     while (cycles < target) {
         step();
         cycles++;   // TODO: replace with real per-instruction cycle costs
@@ -300,6 +308,18 @@ void HuC6280::blockTransfer(BlockMode mode) {
                 break;
         }
     }
+
+    // CONFIRMED cost: 17+6x cycles where x is the transfer length, per
+    // both the Software Manual's instruction table and the Tech Notes'
+    // "Displaying a Speed Gage" worked example (which uses this exact
+    // formula to compute a deliberate CPU-stall for its speedometer
+    // demo). step()'s flat +1 per instruction still applies on top of
+    // this via bus->tickTimer() in step() — that flat cost is a rough
+    // placeholder for everything else, but this is the one place so far
+    // where the real per-instruction cost is wired through accurately.
+    u32 cost = 17 + 6 * len;
+    cycles += cost;
+    if (bus) bus->tickTimer(cost);
 
     // Real hardware sets Z/N based on the final transferred byte and
     // leaves other flags alone; matching that here for consistency with

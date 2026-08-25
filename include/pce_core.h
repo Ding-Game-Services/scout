@@ -267,6 +267,7 @@ private:
 class VDC {
 public:
     void connect(Bus* bus);
+    void connect(IrqController* irq);
     void reset();
     void runLine();   // render one scanline's worth of state
 
@@ -278,6 +279,7 @@ public:
 
 private:
     Bus* bus = nullptr;
+    IrqController* irqController = nullptr;
 
     static constexpr size_t kVramWords = 0x10000;
     u16 vram[kVramWords] = {};
@@ -315,6 +317,27 @@ private:
     void incrementAddress(u16& addr);   // applies IW field from CR
     void doVramToVramBlockTransfer();
 
+    // ── background rendering (this pass) ──
+    // Fixed 256x224 visible area (32x28 characters), 32x32-character
+    // virtual screen (SCREEN=0 mode only), standard 16-color BG mode.
+    // Produces one row of 9-bit VDC video codes (VD0-VD8) per scanline,
+    // ready for VCE::resolveColor(). See file header for what's not
+    // covered yet (other SCREEN sizes, 4-color mode, sprites).
+    static constexpr int kVisibleWidth = 256;
+    static constexpr int kVisibleHeight = 224;
+    u16 videoCodes[kVisibleWidth * kVisibleHeight] = {};
+    int currentLine = 0;
+
+    void renderBackgroundLine(int line);
+
+public:
+    // Read-only access for VCE/framebuffer assembly once a full frame's
+    // worth of lines have run.
+    const u16* getVideoCodes() const { return videoCodes; }
+    int getVisibleWidth() const { return kVisibleWidth; }
+    int getVisibleHeight() const { return kVisibleHeight; }
+
+private:
     // TODO(next step): actual background/sprite pixel generation.
     // runLine() currently advances no rendering state — register access
     // and VRAM/block-transfer plumbing is real, but nothing reads BAT/CG/
@@ -345,6 +368,13 @@ public:
     void reset();
     void writeFramebuffer(uint8_t* fb, uint32_t width, uint32_t height);
 
+    // Resolves a full VDC frame of video codes into an RGBA8 framebuffer.
+    // This is the real path now that VDC's background renderer produces
+    // actual VD0-VD8 codes; writeFramebuffer() above is kept as a
+    // fallback for whenever VDC hasn't run yet (e.g. before any ROM is
+    // loaded) and still just clears to black.
+    void resolveFramebuffer(const u16* videoCodes, uint8_t* fb, int width, int height);
+
     // CPU-facing register access — see class comment for A0/A1/A2 protocol.
     uint8_t readRegister(u16 offset);
     void writeRegister(u16 offset, uint8_t val);
@@ -368,21 +398,85 @@ private:
 };
 
 // ── PSG ──────────────────────────────────────────────────────────────────
-// Programmable Sound Generator built into the HuC6280 — 6 wavetable
-// channels, 2 of which support noise/LFO modes.
+// Programmable Sound Generator, a sub-block of the HuC6280 (not a
+// separate chip — confirmed via HuC62 System Outline Note). 6 channels,
+// waveform-memory synthesis (5 bits x 32 words/cycle), channels 5/6 can
+// swap to noise generation, channel 1 can be frequency-modulated by
+// channel 2 via the built-in LFO.
+//
+// Register layout and channel-select addressing CONFIRMED via HuC6280
+// CMOS Programmable Sound Generator Manual (project file):
+//   - R0 (channel select), R1 (main L/R amplitude), R8 (LFO freq), R9
+//     (LFO control) are singletons, addressed directly by A0-A3.
+//   - R2-R7 are banked per-channel: A0-A3 selects the register *within*
+//     whichever channel R0 currently points at. R7 (noise) only exists
+//     for channels 5/6 (index 4/5 here).
+//   - R4's chON/DDA bits select one of four modes (write/reset-counter/
+//     mixing/direct-D-A) that change what writing R6 does — see
+//     PSG.cpp's onR4Written()/writeRegister() for the confirmed table.
 class PSG {
 public:
     void reset();
     void runFrame();
     uint32_t readSamples(float* buf, uint32_t count);
 
-    // CPU-facing register access, mapped at physical bank $FF, offset
-    // $0800-$0BFF (channel select, volume, waveform, frequency, LFO/noise).
+    // CPU-facing register access, offset&0xF selects R0-R9 directly
+    // (A0-A3) — see class comment for the channel-banking behavior of
+    // R2-R7.
     uint8_t readRegister(u16 offset);
     void writeRegister(u16 offset, uint8_t val);
 
 private:
-    uint32_t sampleCount = 0;
+    static constexpr int kChannelCount = 6;
+
+    struct Channel {
+        u16 freq = 0;        // R2/R3 combined, 12 bits
+        bool chOn = false;   // R4 bit 7
+        bool dda = false;    // R4 bit 6
+        u8 al = 0;           // R4 bits 4-0, amplitude level
+        u8 lal = 0, ral = 0; // R5: L/R amplitude, 4 bits each
+        u8 waveData[32] = {};
+        u8 waveAddr = 0;
+        u8 ddaLatch = 0;     // last value written to R6 in direct-D/A mode
+        bool noiseEnable = false;   // R7 (channels 5/6 only, index 4/5)
+        u8 noiseFreq = 0;           // R7 bits 4-0
+    };
+    Channel channels[kChannelCount];
+
+    u8 channelSelect = 0;   // R0 — 0-5 select ch1-ch6
+    u8 mainAmpLeft = 0, mainAmpRight = 0;   // R1
+    u8 lfoFreq = 0;          // R8
+    bool lfTrg = false;      // R9 bit 7
+    u8 lfCtl = 0;            // R9 bits 1-0
+
+    void onR4Written(Channel& ch);
+    void onR6Written(Channel& ch, u8 val);
+
+    // TODO(next step): actual sample synthesis. All register state above
+    // is real and matches the confirmed hardware behavior, but runFrame()
+    // and readSamples() don't yet turn it into audio — that needs a
+    // waveform-table sample generator per channel, LFO frequency
+    // modulation of channel 1 by channel 2 (per §2.1.10's confirmed
+    // addition/shift table), noise generation for channels 5/6, and
+    // final L/R mixing through R1/R4/R5's amplitude stages.
+    //
+    // CONFIRMED frequency formulas, cross-checked between the official
+    // manual and PCE_PSG_Hardware_Documentation.htm (Paul Clifford) —
+    // both agree once you account for fmaster=7.16MHz vs. the already-
+    // halved 3.58MHz the community doc uses as its base:
+    //   waveform: freq_hz = 3580000 / (32 * F)          F = 12-bit reg value
+    //   noise:    freq_hz = 3580000 / (64 * (NF XOR 31)) NF = 5-bit reg value
+    //   LFO:      freq_hz = 3580000 / (32 * F2 * FLF)    F2=ch2's F, FLF=R8
+    //
+    // UNRESOLVED CONFLICT — LF CTL shift amounts: the official manual's
+    // diagram implies 0/2/4-bit left shifts for LFCTL=1/2/3. The
+    // community doc gives a worked example (LFCTL=2, wave value %10111
+    // = -9 signed, result "(-9 << 4) added") that only holds together
+    // with 0/4/8-bit shifts. Leaning toward the community doc here since
+    // a concrete worked example is harder to misread than an OCR'd
+    // ASCII diagram, but this needs a real hardware/test-ROM check
+    // before the LFO modulation math gets implemented — don't guess
+    // between them silently when that day comes.
 };
 
 // ── PCEngine ─────────────────────────────────────────────────────────────

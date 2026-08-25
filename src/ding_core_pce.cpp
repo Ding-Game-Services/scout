@@ -32,7 +32,9 @@ DingCoreInfo g_coreInfo = {
 };
 
 DingVideoInfo g_videoInfo = {
-    256, 239,          // base_width/height — most common PCE mode
+    256, 224,          // matches VDC::kVisibleWidth/kVisibleHeight — see
+                       // VDC.cpp for what's simplified (fixed 32x32
+                       // virtual screen, no other SCREEN sizes yet)
     kMaxWidth, kMaxHeight,
     DING_PIXFMT_RGBA8,
     1,                 // dynamic — VDC supports multiple horizontal timings
@@ -78,7 +80,9 @@ void ding_reset() {
 
 void ding_run_frame() {
     g_engine.runFrame();
-    g_engine.vce.writeFramebuffer(g_framebuffer, g_videoInfo.base_width, g_videoInfo.base_height);
+    g_engine.vce.resolveFramebuffer(
+        g_engine.vdc.getVideoCodes(), g_framebuffer,
+        g_engine.vdc.getVisibleWidth(), g_engine.vdc.getVisibleHeight());
 }
 
 // ── ROM loading ──────────────────────────────────────────────────────────

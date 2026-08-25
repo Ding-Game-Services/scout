@@ -1,7 +1,10 @@
 /*
  * Timer.cpp — HuC6280 built-in timer
  *
- * CONFIRMED via Hardware Manual §2.7-2.9:
+ * CONFIRMED via Hardware Manual §2.7-2.9, independently re-confirmed
+ * via PCE_CPU_Hardware_Documentation.htm (project file: identical
+ * $0C00/$0C01 register split and "interrupt raised on carry, i.e. when
+ * about to decrement from zero" behavior):
  *   - $0C00 (even offset): reload value (write) / live downcounter (read)
  *   - $0C01 (odd offset): control register, bit0 = start(1)/stop(0)
  *   - Divider: downcounter decrements at OSC1/3/1024. At 7.16MHz (CSH),
