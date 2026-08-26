@@ -330,6 +330,29 @@ private:
 
     void renderBackgroundLine(int line);
 
+    // ── sprites (this pass) ──
+    // CONFIRMED via VDC Manual §2.4.2/2.4.3: SAT entry is 4 words
+    // (Y coord, X coord, pattern code, attribute word). SATB storage
+    // is real now — VRAM-SATB block transfer (triggered by DVSSR high
+    // byte, per §2.1.3(21) NOTE b) is deferred to the next vblank
+    // boundary rather than firing immediately, matching confirmed
+    // hardware timing now that runLine() has a real frame-boundary hook.
+    //
+    // NOT confirmed with confidence: the attribute word's exact bit
+    // layout for SPBG/flip/CGX/CGY comes from a diagram that OCR'd too
+    // ambiguously to trust. SPRITE COLOR (bits 3-0) and SPBG (bit 7) are
+    // implemented at medium-high confidence (consistent with every other
+    // "COLOR nibble + flag bit" field in this document family), but
+    // flip (X̄/Ȳ) and CGX/CGY sprite-combining are explicitly NOT wired
+    // this pass — defaulting to no-flip, no-combine — rather than risk
+    // silently-wrong orientation that's hard to notice when testing.
+    struct Sprite { u16 y = 0, x = 0, pattern = 0, attr = 0; };
+    Sprite satb[64];
+    bool satbTransferPending = false;
+
+    void renderSpriteLine(int line);
+    void doVramToSatbTransfer();
+
 public:
     // Read-only access for VCE/framebuffer assembly once a full frame's
     // worth of lines have run.
@@ -338,10 +361,6 @@ public:
     int getVisibleHeight() const { return kVisibleHeight; }
 
 private:
-    // TODO(next step): actual background/sprite pixel generation.
-    // runLine() currently advances no rendering state — register access
-    // and VRAM/block-transfer plumbing is real, but nothing reads BAT/CG/
-    // SAT/SG to produce pixels yet. That's the next VDC pass.
 };
 
 // ── VCE ──────────────────────────────────────────────────────────────────

@@ -26,27 +26,36 @@
  *     official manual and PCE_Hardware_Documentation.htm). Reading SR
  *     drops the line again, matching its clear-on-read behavior.
  *
- * NOT implemented this pass (flagged in pce_core.h):
- *   - Actual background/sprite pixel generation (runLine is a no-op)
- *   - Collision and scanline-match interrupts aren't wired yet — they
- *     depend on real sprite/scanline logic that doesn't exist until the
- *     rendering pass lands. Only the two DMA-completion interrupts are
- *     live right now, since those are the only status conditions
- *     anything currently sets.
- *   - VRAM-SATB block transfer (DVSSR) — register write is accepted and
- *     sets statusSatbEnd on the *next* call for now, but doesn't actually
- *     move data anywhere since SATB storage doesn't exist yet (that's
- *     part of the sprite rendering work, not yet built)
- *   - VRAM-VRAM transfer is NOT deferred to vblank like real hardware
- *     (manual: "can be performed during a vertical blanking period or in
- *     the burst mode") — this executes it immediately/atomically on the
- *     LENR high-byte write. Fine for correctness, wrong for timing-
- *     sensitive games.
- *   - BSY (status bit 6) never asserts — this implementation's VRAM
- *     access is instant/atomic rather than taking real bus cycles, so
- *     there's no window where BSY would meaningfully read as set. Only
- *     matters if a game busy-polls BSY expecting it to eventually clear
- *     after starting non-instant.
+ *   - BUG FOUND AND FIXED (harness testing): statusVblank was never set
+ *     anywhere, causing standard vsync-wait boot loops to spin forever.
+ *     Now pulses once per frame in runLine() — see the fix there for
+ *     the full explanation and its remaining timing imprecision.
+ *
+ * NOT implemented / not confirmed (see also the sprites section comment
+ * further down for confidence caveats on SPBG/flip/CGX/CGY):
+ *   - Collision interrupt isn't wired — no collision *detection* exists
+ *     yet (would need per-pixel sprite-vs-sprite-0 overlap tracking
+ *     during compositing, not just drawing). Scanline-match interrupt
+ *     also isn't wired — needs RCR compared against a real scanline
+ *     counter, which runLine() doesn't track yet (it just counts visible
+ *     lines 0-223, not a real counter starting at 64 per the confirmed
+ *     Tech Notes convention).
+ *   - 4-color BG mode, SCREEN sizes other than 32x32, and CGX/CGY sprite
+ *     combining are all unimplemented — standard 16-color/32x32-BG/
+ *     16x16-sprite mode only.
+ *   - Sprite flip (X̄/Ȳ) not wired — the attribute word's bit positions
+ *     for this weren't confirmable from the manual's OCR'd diagram, so
+ *     rather than guess, sprites always render unflipped.
+ *   - No 16-sprites-per-scanline cap enforcement.
+ *   - VRAM-VRAM transfer and VRAM-SATB transfer are NOT cycle-accurate —
+ *     VRAM-VRAM still executes atomically on the LENR high-byte write
+ *     (manual says it should span a vblank/burst-mode period); VRAM-SATB
+ *     is now correctly deferred to the vblank *boundary* per the manual,
+ *     but doesn't model the real per-transfer duration within that
+ *     window either.
+ *   - BSY (status bit 6) never asserts — VRAM access is instant/atomic
+ *     in this implementation, so there's no window where BSY would
+ *     meaningfully read as set.
  */
 
 #include "pce_core.h"
@@ -68,12 +77,48 @@ void VDC::reset() {
     ar = 0;
     statusCollision = statusOver = statusScanlineMatch = false;
     statusSatbEnd = statusVramEnd = statusVblank = statusBusy = false;
+    for (auto& sp : satb) sp = Sprite{};
+    satbTransferPending = false;
+    currentLine = 0;
+    std::memset(videoCodes, 0, sizeof(videoCodes));
 }
 
 void VDC::runLine() {
     renderBackgroundLine(currentLine);
+    renderSpriteLine(currentLine);
     currentLine++;
-    if (currentLine >= kVisibleHeight) currentLine = 0;
+    if (currentLine >= kVisibleHeight) {
+        currentLine = 0;
+
+        // BUG FIX: nothing was ever setting statusVblank, so any ROM
+        // doing the standard "wait for VSYNC" boot pattern (poll SR bit
+        // 5, confirmed as the real-world convention via the HuC62 Tech
+        // Notes' vsync_wait example) would spin forever — this is what
+        // was causing PC to freeze at a fixed address across many
+        // frames instead of ever progressing past boot.
+        //
+        // Pulses once per frame at the visible-area boundary rather than
+        // tracking the real non-visible scanline count/duration (see
+        // PCEngine::runFrame's TODO about CPU/VDC not being interleaved
+        // per-scanline yet) — close enough to unblock polling loops, not
+        // yet accurate for anything timing-sensitive within vblank.
+        statusVblank = true;
+
+        // CR bit3 = VC (vertical blanking period detect enable),
+        // confirmed via the Software Manual's IE field table.
+        if ((regs[REG_CR] & 0x08) != 0 && irqController) {
+            irqController->setLine(1, true);
+        }
+
+        // VRAM-SATB transfer, deferred to the vblank boundary — confirmed
+        // §2.1.3(21) NOTE (b). DCR bit4 (DSR) makes it auto-repeat every
+        // vblank; otherwise it only fires once per DVSSR high-byte write.
+        bool autoRepeat = (regs[REG_DCR] & 0x10) != 0;
+        if (satbTransferPending || autoRepeat) {
+            doVramToSatbTransfer();
+            satbTransferPending = false;
+        }
+    }
 }
 
 // ── background rendering ────────────────────────────────────────────────
@@ -96,11 +141,11 @@ void VDC::runLine() {
 //     one part of this function that could be backwards pending a real
 //     test-ROM comparison.
 //
-// NOT implemented this pass: sprites, 4-color BG mode, SCREEN sizes
-// other than 32x32, and the CG COLOR block correctly offsetting into
-// VCE's *background* half of the color table (currently assumed to
-// start at color-table index 0 — matches the background half per VCE
-// manual §2.2.1, so this one should already be correct).
+// NOT implemented this pass: 4-color BG mode, SCREEN sizes other than
+// 32x32, and the CG COLOR block correctly offsetting into VCE's
+// *background* half of the color table (currently assumed to start at
+// color-table index 0 — matches the background half per VCE manual
+// §2.2.1, so this one should already be correct).
 void VDC::renderBackgroundLine(int line) {
     if (!bus) return;
 
@@ -149,6 +194,93 @@ void VDC::renderBackgroundLine(int line) {
         // per tile.
         u16 videoCode = (pixel == 0) ? 0 : static_cast<u16>((cgColor << 4) | pixel);
         videoCodes[line * kVisibleWidth + x] = videoCode;
+    }
+}
+
+// ── sprites ──────────────────────────────────────────────────────────────
+
+void VDC::doVramToSatbTransfer() {
+    u16 src = regs[REG_DVSSR];
+    for (int i = 0; i < 64; i++) {
+        satb[i].y       = vram[static_cast<u16>(src + i * 4 + 0) & (kVramWords - 1)];
+        satb[i].x       = vram[static_cast<u16>(src + i * 4 + 1) & (kVramWords - 1)];
+        satb[i].pattern = vram[static_cast<u16>(src + i * 4 + 2) & (kVramWords - 1)];
+        satb[i].attr    = vram[static_cast<u16>(src + i * 4 + 3) & (kVramWords - 1)];
+    }
+
+    statusSatbEnd = true;
+    // DCR bit0 = DSC (SATB transfer complete IRQ enable), confirmed both
+    // in the official manual and independently in PCE_Hardware_Documentation.htm.
+    if ((regs[REG_DCR] & 0x01) != 0 && irqController) {
+        irqController->setLine(1, true);
+    }
+}
+
+// CONFIRMED tile layout via VDC Manual §2.4.2/2.4.3/2.4.4:
+//   - Sprite screen position = SAT (Y,X) minus the documented coordinate
+//     origin offset (32,64) — Fig 2-2-1 explicitly labels sprite
+//     coordinate (32,64) as screen position (0,0).
+//   - Pattern base address = pattern code with its low 6 bits zeroed
+//     ("SG0 should align at address X...X000000 binary" — the code's own
+//     top 10 bits become the address's top 10 bits directly).
+//   - SG0/SG1/SG2/SG3 each occupy 16 consecutive words after that base
+//     (64 words total for one 16x16 sprite, standard non-CGX/CGY mode).
+//   - Pixel color = SG3:SG2:SG1:SG0 (SG3 is the MSB), per §2.4.4's
+//     "VD3-VD0 = SG3-SG0" video-output table — same bit-order convention
+//     as the background's CH3:CH2:CH1:CH0.
+//   - Sprite priority: "the priority of sprites follows that of
+//     addresses" (§2.4.2) — sprite 0 highest. Implemented by iterating
+//     63→0 so lower-index sprites are drawn last and end up on top.
+//   - SPBG (bg-vs-sprite priority) tested against a per-line snapshot of
+//     which pixels the background left transparent, taken before any
+//     sprite compositing — see class comment for confidence caveats on
+//     SPBG's bit position and the explicitly-unimplemented flip/CGX/CGY.
+void VDC::renderSpriteLine(int line) {
+    if (!bus) return;
+
+    bool bgTransparent[kVisibleWidth];
+    for (int x = 0; x < kVisibleWidth; x++) {
+        bgTransparent[x] = (videoCodes[line * kVisibleWidth + x] == 0);
+    }
+
+    constexpr int kSpriteHeight = 16;   // standard mode only — no CGY combining this pass
+    constexpr int kSpriteWidth = 16;    // standard mode only — no CGX combining this pass
+
+    for (int i = 63; i >= 0; i--) {
+        const Sprite& sp = satb[i];
+
+        int screenY = static_cast<int>(sp.y) - 64;
+        int screenX = static_cast<int>(sp.x) - 32;
+        if (line < screenY || line >= screenY + kSpriteHeight) continue;
+        int row = line - screenY;
+
+        u16 patternBase = sp.pattern & 0xFFC0;
+        u16 sg0 = vram[static_cast<u16>(patternBase + row) & (kVramWords - 1)];
+        u16 sg1 = vram[static_cast<u16>(patternBase + 16 + row) & (kVramWords - 1)];
+        u16 sg2 = vram[static_cast<u16>(patternBase + 32 + row) & (kVramWords - 1)];
+        u16 sg3 = vram[static_cast<u16>(patternBase + 48 + row) & (kVramWords - 1)];
+
+        u8 spriteColor = static_cast<u8>(sp.attr & 0x0F);
+        bool spbg = (sp.attr & 0x80) != 0;
+
+        for (int col = 0; col < kSpriteWidth; col++) {
+            int x = screenX + col;
+            if (x < 0 || x >= kVisibleWidth) continue;
+
+            int bitPos = 15 - col;   // MSB = leftmost, same convention as background
+            u8 pixel = static_cast<u8>(
+                ((sg0 >> bitPos) & 1)       |
+                (((sg1 >> bitPos) & 1) << 1) |
+                (((sg2 >> bitPos) & 1) << 2) |
+                (((sg3 >> bitPos) & 1) << 3));
+            if (pixel == 0) continue;   // transparent
+
+            if (!spbg && !bgTransparent[x]) continue;   // background wins per SPBG=0
+
+            // Video code per §2.4.4: VD8=1(sprite), VD7-4=SP COLOR, VD3-0=pattern.
+            videoCodes[line * kVisibleWidth + x] =
+                static_cast<u16>(0x100 | (spriteColor << 4) | pixel);
+        }
     }
 }
 
@@ -263,16 +395,11 @@ void VDC::onHighByteWritten(u8 regIndex) {
         case REG_DVSSR:
             // VRAM-SATB transfer trigger — confirmed §2.1.3(21) NOTE (b)
             // and independently by PCE_Hardware_Documentation.htm: real
-            // hardware defers this to the *next vertical sync* rather
-            // than firing immediately, and auto-repeats every vsync if
-            // DCR bit4 (DSR) is set. This still fires immediately since
-            // SATB storage itself isn't implemented yet (see file
-            // header) — the timing gap doesn't matter until real sprite
-            // data actually needs to land at the right moment.
-            statusSatbEnd = true;
-            if ((regs[REG_DCR] & 0x01) != 0 && irqController) {   // DSC bit
-                irqController->setLine(1, true);
-            }
+            // hardware defers this to the *next vertical sync*. Now that
+            // SATB storage is real (see sprites section, this pass), the
+            // transfer actually happens in runLine()'s vblank boundary
+            // via doVramToSatbTransfer() — this just arms it.
+            satbTransferPending = true;
             break;
 
         default:
