@@ -44,8 +44,24 @@ uint8_t Bus::readMPR(uint8_t index) const {
     return mpr[index & 0x07];
 }
 
-void Bus::writeMPR(uint8_t index, uint8_t bank) {
-    mpr[index & 0x07] = bank;
+void Bus::writeMPR(uint8_t index, uint8_t bank, u16 debugPC) {
+    index &= 0x07;
+    mpr[index] = bank;
+
+    mprLog[mprLogHead] = { debugPC, index, bank };
+    mprLogHead = (mprLogHead + 1) % kMprLogSize;
+    if (mprLogCount < kMprLogSize) mprLogCount++;
+}
+
+size_t Bus::getMprLog(MprLogEntry* out, size_t maxEntries) const {
+    if (!out || maxEntries == 0) return 0;
+    size_t n = mprLogCount < maxEntries ? maxEntries : mprLogCount;
+    n = mprLogCount < maxEntries ? mprLogCount : maxEntries;
+    size_t start = (mprLogCount < kMprLogSize) ? 0 : mprLogHead;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = mprLog[(start + i) % kMprLogSize];
+    }
+    return n;
 }
 
 Bus::PhysAddr Bus::resolve(u32 cpuAddr) const {
@@ -70,7 +86,13 @@ uint8_t Bus::read(u32 addr) {
     return 0xFF;
 }
 
-void Bus::write(u32 addr, uint8_t val) {
+void Bus::write(u32 addr, uint8_t val, u16 debugPC) {
+    // Watchpoints check the CPU-visible address (pre-bank-resolve) since
+    // that's what a human debugging boot code actually reasons about
+    // ("zero-page $04"), not the physical bank+offset it happens to
+    // resolve to under current MPR mapping.
+    checkWatchpoint(static_cast<u16>(addr), val, debugPC);
+
     PhysAddr p = resolve(addr);
 
     if (p.bank <= 0x7F) {
@@ -81,11 +103,48 @@ void Bus::write(u32 addr, uint8_t val) {
         return;
     }
     if (p.bank == 0xFF) {
-        writeHardwarePage(p.offset, val);
+        writeHardwarePage(p.offset, val, debugPC);
         return;
     }
 
     // $F7 backup RAM write support TODO; everything else no-op.
+}
+
+void Bus::addWatchpoint(u16 addr) {
+    for (size_t i = 0; i < watchCount; i++) {
+        if (watchAddrs[i] == addr) return;   // already watched
+    }
+    if (watchCount < kMaxWatchpoints) {
+        watchAddrs[watchCount++] = addr;
+    }
+}
+
+void Bus::clearWatchpoints() {
+    watchCount = 0;
+    watchLogHead = 0;
+    watchLogCount = 0;
+    std::memset(watchLog, 0, sizeof(watchLog));
+}
+
+void Bus::checkWatchpoint(u16 addr, u8 val, u16 debugPC) {
+    for (size_t i = 0; i < watchCount; i++) {
+        if (watchAddrs[i] == addr) {
+            watchLog[watchLogHead] = { debugPC, addr, val };
+            watchLogHead = (watchLogHead + 1) % kWatchLogSize;
+            if (watchLogCount < kWatchLogSize) watchLogCount++;
+            return;
+        }
+    }
+}
+
+size_t Bus::getWatchLog(WatchEntry* out, size_t maxEntries) const {
+    if (!out || maxEntries == 0) return 0;
+    size_t n = watchLogCount < maxEntries ? watchLogCount : maxEntries;
+    size_t start = (watchLogCount < kWatchLogSize) ? 0 : watchLogHead;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = watchLog[(start + i) % kWatchLogSize];
+    }
+    return n;
 }
 
 uint8_t Bus::readHardwarePage(u16 offset) {
@@ -102,8 +161,8 @@ uint8_t Bus::readHardwarePage(u16 offset) {
     return 0xFF;
 }
 
-void Bus::writeHardwarePage(u16 offset, uint8_t val) {
-    if (offset < 0x0400) { if (vdc) vdc->writeRegister(offset, val); return; }
+void Bus::writeHardwarePage(u16 offset, uint8_t val, u16 debugPC) {
+    if (offset < 0x0400) { if (vdc) vdc->writeRegister(offset, val, debugPC); return; }
     if (offset < 0x0800) { if (vce) vce->writeRegister(offset - 0x0400, val); return; }
     if (offset < 0x0C00) { if (psg) psg->writeRegister(offset - 0x0800, val); return; }
     if (offset < 0x1000) { if (timer) timer->writeRegister(offset - 0x0C00, val); return; }

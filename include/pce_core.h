@@ -87,16 +87,25 @@ private:
 //   $1403: interrupt request — read: pending flags; write: acks timer IRQ
 class IrqController {
 public:
-    void reset();
+ void reset();
     void setLine(int which, bool asserted);   // 0=IRQ2 1=IRQ1 2=TIQ
     bool pending(int which) const;
+
+    // diagnostics
+    u32 getAssertCount(int which) const { return (which >= 0 && which < 3) ? assertCount[which] : 0; }
+    u32 getServiceCount(int which) const { return (which >= 0 && which < 3) ? serviceCount[which] : 0; }
+    void noteServiced(int which) { if (which >= 0 && which < 3) serviceCount[which]++; }
 
     uint8_t readRegister(u16 offset);
     void writeRegister(u16 offset, uint8_t val);
 
 private:
-    uint8_t disableMask = 0;
+ uint8_t disableMask = 0;
     bool lines[3] = {};   // raw asserted state per line, pre-mask
+
+    // ── debug counters (diagnostics only, not part of real hardware) ──
+    u32 assertCount[3] = {};   // times setLine(n, true) was called
+    u32 serviceCount[3] = {};  // times pending(n) caused actual IRQ service
 };
 
 class VDC;
@@ -128,8 +137,11 @@ public:
     void connect(Joypad* joypad);
     void connect(IrqController* irq);
 
-    uint8_t read(u32 addr);
-    void write(u32 addr, uint8_t val);
+ uint8_t read(u32 addr);
+    // debugPC is forwarded to VDC's diagnostic register log only — no
+    // functional effect. Defaults to 0 for any caller that doesn't have
+    // a meaningful PC (e.g. non-CPU-initiated writes, if any ever exist).
+    void write(u32 addr, uint8_t val, u16 debugPC = 0);
 
     void reset();
 
@@ -137,10 +149,27 @@ public:
     // controller as a TIQ. Called from HuC6280::runFrame() per step.
     void tickTimer(u32 cpuCycles);
 
-    // MPR access — CPU's TAM/TMA opcodes will call these once implemented.
+ // MPR access — CPU's TAM/TMA opcodes will call these once implemented.
     // index is 0-7 (one per 8KB page of CPU address space).
     uint8_t readMPR(uint8_t index) const;
-    void writeMPR(uint8_t index, uint8_t bank);
+    void writeMPR(uint8_t index, uint8_t bank, u16 debugPC = 0);
+
+    // ── MPR write log (diagnostics only) ──
+    static constexpr size_t kMprLogSize = 32;
+    struct MprLogEntry { u16 pc; u8 index; u8 bank; };
+    size_t getMprLog(MprLogEntry* out, size_t maxEntries) const;
+
+    // ── general write watchpoints (diagnostics only) ──────────────────
+    // Watch a small set of CPU addresses; every write to a watched
+    // address gets logged with the PC that made it. General-purpose
+    // replacement for one-off hunts like "who's writing zero-page $04".
+    static constexpr size_t kMaxWatchpoints = 8;
+    static constexpr size_t kWatchLogSize = 64;
+    struct WatchEntry { u16 pc; u16 addr; u8 val; };
+
+    void addWatchpoint(u16 addr);       // no-op if already watched or table full
+    void clearWatchpoints();
+    size_t getWatchLog(WatchEntry* out, size_t maxEntries) const;
 
 private:
     Cartridge*     cartridge = nullptr;
@@ -154,13 +183,26 @@ private:
     uint8_t wram[0x2000] = {};   // 8KB internal work RAM (physical bank $F8)
     uint8_t mpr[8] = {};         // memory mapping registers (bank select)
 
+    // ── watchpoint state ──
+    u16 watchAddrs[kMaxWatchpoints] = {};
+    size_t watchCount = 0;
+    WatchEntry watchLog[kWatchLogSize] = {};
+    size_t watchLogHead = 0;
+    size_t watchLogCount = 0;
+void checkWatchpoint(u16 addr, u8 val, u16 debugPC);
+
+    // ── MPR write log state ──
+    MprLogEntry mprLog[kMprLogSize] = {};
+    size_t mprLogHead = 0;
+    size_t mprLogCount = 0;
+
     // Physical bank + 13-bit offset a CPU address resolves to under the
     // current MPR mapping.
     struct PhysAddr { uint8_t bank; u16 offset; };
     PhysAddr resolve(u32 cpuAddr) const;
 
     uint8_t readHardwarePage(u16 offset);
-    void writeHardwarePage(u16 offset, uint8_t val);
+    void writeHardwarePage(u16 offset, uint8_t val, u16 debugPC);
 };
 
 // ── HuC6280 ──────────────────────────────────────────────────────────────
@@ -181,16 +223,28 @@ public:
         FLAG_N = 0x80,  // negative
     };
 
-    void connect(Bus* bus);
+// ── instruction trace ring buffer (diagnostics only) ──
+static constexpr size_t kTraceSize = 256;
+    static constexpr size_t kBootTraceSize = 4096;   // bumped from 512 — needed to see past early init loops
+    struct TraceEntry { u16 pc; u8 opcode; };
+
+void connect(Bus* bus);
     void connect(IrqController* irq);
     void reset();
     void step();   // execute one instruction, returns via cycles accumulator
     void runFrame();
+    void runFor(u64 targetCycles);   // run until `cycles` has advanced by targetCycles
 
     void nmi();
 
-    // diagnostics
+ // diagnostics
     size_t dumpState(char* buf, size_t buf_size) const;
+    u32 getCliCount() const { return cliCount; }
+
+// Returns entries oldest-to-newest into out[], up to maxEntries.
+    // Returns how many were written.
+    size_t getTrace(TraceEntry* out, size_t maxEntries) const;
+    size_t getBootTrace(TraceEntry* out, size_t maxEntries) const;
 
 private:
     Bus* bus = nullptr;
@@ -201,7 +255,22 @@ private:
     u8  p = FLAG_T | FLAG_I;   // status flags — IRQ disabled + reserved bit set on reset
     u8  speed = 0;             // CPU speed register: 0 = 1.79MHz, 1 = 7.16MHz
 
-    u64 cycles = 0;
+ u64 cycles = 0;
+
+// ── debug counters (diagnostics only, not part of real hardware) ──
+    u32 cliCount = 0;   // times CLI (0x58) has executed
+
+ // ── instruction trace ring buffer (diagnostics only) ──
+    TraceEntry trace[kTraceSize] = {};
+    size_t traceHead = 0;   // next write index
+    size_t traceCount = 0;  // entries filled so far, caps at kTraceSize
+
+// ── boot trace: first N instructions after reset, non-overwriting ──
+    // Unlike the rolling ring buffer above, this captures the actual boot
+    // path once and stops — useful when a wait loop runs for thousands of
+    // instructions and would otherwise drown out the lead-up in `trace`.
+    TraceEntry bootTrace[kBootTraceSize] = {};
+    size_t bootTraceCount = 0;   // stays put once it hits kBootTraceSize
 
     // ── memory helpers ──
     u8  fetch8();
@@ -271,9 +340,11 @@ public:
     void reset();
     void runLine();   // render one scanline's worth of state
 
-    // CPU-facing register access — see class comment for A0/A1 protocol.
+ // CPU-facing register access — see class comment for A0/A1 protocol.
+    // writeRegister takes the CPU's current PC purely for diagnostics
+    // (regLog attribution) — no functional effect on VDC behavior.
     uint8_t readRegister(u16 offset);
-    void writeRegister(u16 offset, uint8_t val);
+    void writeRegister(u16 offset, uint8_t val, u16 debugPC = 0);
 
     size_t dumpState(char* buf, size_t buf_size) const;
 
@@ -313,9 +384,27 @@ private:
     bool statusVblank = false;
     bool statusBusy = false;
 
-    void onHighByteWritten(u8 regIndex);
+void onHighByteWritten(u8 regIndex);
     void incrementAddress(u16& addr);   // applies IW field from CR
     void doVramToVramBlockTransfer();
+
+    // ── register-write log (diagnostics only) ──
+    // Records every committed (high-byte-write) register update, so we can
+    // answer "did CR ever get written, and to what" without hand-decoding
+    // opcode traces.
+public:
+    static constexpr size_t kRegLogSize = 128;
+    struct RegLogEntry { u16 pc; u8 regIndex; u16 value; };
+private:
+    RegLogEntry regLog[kRegLogSize] = {};
+    size_t regLogHead = 0;
+    size_t regLogCount = 0;
+    void logRegWrite(u16 pc, u8 regIndex, u16 value);
+
+public:
+    size_t getRegLog(RegLogEntry* out, size_t maxEntries) const;
+
+private:
 
     // ── background rendering (this pass) ──
     // Fixed 256x224 visible area (32x28 characters), 32x32-character

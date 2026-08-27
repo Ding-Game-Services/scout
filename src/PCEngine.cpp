@@ -34,12 +34,33 @@ bool PCEngine::loadRom(const uint8_t* data, size_t len) {
 }
 
 void PCEngine::runFrame() {
-    // TODO: real timing loop interleaving cpu.step()/vdc.runLine() per
-    // scanline (currently CPU and VDC run as separate flat passes, not
-    // interleaved cycle-by-cycle) — and real NTSC line count (262/263
-    // total including vblank) instead of just the visible area.
-    cpu.runFrame();
-    for (int line = 0; line < vdc.getVisibleHeight(); ++line) {
+    // BUG FIX (harness testing — Alien Crush and others): this used to run
+    // cpu.runFrame() (the CPU's entire 119,904-cycle budget) BEFORE any
+    // vdc.runLine() calls. Since VDC's vblank IRQ1 assertion only happens
+    // inside runLine(), the CPU could never observe an IRQ1 during its own
+    // execution — any game polling a vblank-driven flag (an extremely
+    // common, correct pattern) would spin forever. Confirmed via IRQ
+    // counter diagnostics: CLI executed, interrupts were enabled, but
+    // IRQ1_ASSERT stayed 0 for hundreds of frames under the old ordering.
+    //
+    // Now interleaved per visible scanline so VDC gets a chance to run
+    // (and fire IRQ1) partway through the CPU's frame, not just after it.
+    //
+    // STILL a simplification vs real hardware:
+    //   - kCyclesPerLine is 119904 split evenly across only the visible
+    //     lines (224), not the real 262/263-line NTSC total including
+    //     vblank — so overall frame cycle count is right but per-line
+    //     timing isn't scanline-accurate yet.
+    //   - CPU cycles don't line up 1:1 with real HuC6280 per-opcode
+    //     timing (see HuC6280::step()'s existing TODO), so line boundaries
+    //     are approximate regardless.
+    // Good enough to unblock IRQ-dependent boot code; real scanline-
+    // accurate timing is future work.
+    const int visibleLines = vdc.getVisibleHeight();
+    const u64 kCyclesPerLine = 119904 / static_cast<u64>(visibleLines);
+
+    for (int line = 0; line < visibleLines; ++line) {
+        cpu.runFor(kCyclesPerLine);
         vdc.runLine();
     }
     psg.runFrame();

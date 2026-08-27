@@ -19,10 +19,13 @@
 void IrqController::reset() {
     disableMask = 0;
     lines[0] = lines[1] = lines[2] = false;
+    assertCount[0] = assertCount[1] = assertCount[2] = 0;
+    serviceCount[0] = serviceCount[1] = serviceCount[2] = 0;
 }
 
 void IrqController::setLine(int which, bool asserted) {
     if (which < 0 || which > 2) return;
+    if (asserted && !lines[which]) assertCount[which]++;   // count rising edges only
     lines[which] = asserted;
 }
 

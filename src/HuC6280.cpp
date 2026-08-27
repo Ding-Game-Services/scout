@@ -58,8 +58,9 @@ void HuC6280::reset() {
     a = x = y = 0;
     s = 0xFF;
     p = FLAG_T | FLAG_I;
-    speed = 0;
+speed = 0;
     cycles = 0;
+    bootTraceCount = 0;   // re-capture boot path from this reset onward
 
     // CONFIRMED via original Hardware Manual §2.1.3 (physical $1FFE/
     // $1FFF at reset = logical $FFFE/$FFFF since MPR7=0) and
@@ -82,7 +83,7 @@ u8 HuC6280::read8(u16 addr) {
 }
 
 void HuC6280::write8(u16 addr, u8 val) {
-    if (bus) bus->write(addr, val);
+    if (bus) bus->write(addr, val, pc);
 }
 
 u8 HuC6280::fetch8() {
@@ -213,7 +214,8 @@ void HuC6280::handleIrqIfPending() {
               : irqController->pending(1) ? 1
               : irqController->pending(0) ? 0
               : -1;
-    if (which < 0) return;
+ if (which < 0) return;
+    irqController->noteServiced(which);
 
     push16(pc);
     push8(p & static_cast<u8>(~FLAG_B));
@@ -240,7 +242,20 @@ void HuC6280::handleIrqIfPending() {
 
 void HuC6280::step() {
     handleIrqIfPending();
+    u16 pcBefore = pc;
     u8 opcode = fetch8();
+
+// Record into the trace ring buffer BEFORE execute() so pc reflects
+    // where the opcode byte actually was, not wherever execute() leaves it.
+    trace[traceHead] = { pcBefore, opcode };
+    traceHead = (traceHead + 1) % kTraceSize;
+    if (traceCount < kTraceSize) traceCount++;
+
+    if (bootTraceCount < kBootTraceSize) {
+        bootTrace[bootTraceCount] = { pcBefore, opcode };
+        bootTraceCount++;
+    }
+
     execute(opcode);
     if (bus) bus->tickTimer(1);   // TODO: real per-instruction cycle count, not a flat 1
 }
@@ -251,7 +266,19 @@ void HuC6280::runFrame() {
     // 119,904 machine cycles per VSYNC." Replaces the earlier 29780
     // placeholder guess. Still doesn't sync against real VDC scanline
     // timing — this is a flat per-frame budget, not scanline-accurate.
-    const u64 target = cycles + 119904;
+    //
+    // NOTE: kept for API parity / anything that wants a whole-frame flat
+    // run, but PCEngine::runFrame() no longer calls this — see runFor()
+    // below and the BUG FIX note in PCEngine.cpp. A full-frame flat run
+    // never lets VDC observe mid-frame, so any game polling a vblank IRQ
+    // flag can't ever see it change — this was the root cause of several
+    // titles (Alien Crush confirmed via boot trace + IRQ counters) hanging
+    // in a wait loop forever despite otherwise-correct boot code.
+    runFor(119904);
+}
+
+void HuC6280::runFor(u64 targetCycles) {
+    const u64 target = cycles + targetCycles;
     while (cycles < target) {
         step();
         cycles++;   // TODO: replace with real per-instruction cycle costs
@@ -521,10 +548,10 @@ void HuC6280::execute(u8 opcode) {
         case 0x5A: push8(y); break;                             // PHY [HuC6280]
         case 0x7A: y = pop8(); setZN(y); break;                 // PLY [HuC6280]
 
-        // ── Flag ops ──
+// ── Flag ops ──
         case 0x18: setFlag(FLAG_C, false); break;
         case 0x38: setFlag(FLAG_C, true);  break;
-        case 0x58: setFlag(FLAG_I, false); break;
+        case 0x58: setFlag(FLAG_I, false); cliCount++; break;
         case 0x78: setFlag(FLAG_I, true);  break;
         case 0xB8: setFlag(FLAG_V, false); break;
         case 0xD8: setFlag(FLAG_D, false); break;
@@ -590,10 +617,10 @@ void HuC6280::execute(u8 opcode) {
         // Operand is a bitmask; for TAM each set bit selects an MPR index
         // to load from A. For TMA the (typically single) set bit selects
         // which MPR's value gets read into A.
-        case 0x53: {
+ case 0x53: {
             u8 mask = fetch8();
             for (int i = 0; i < 8; i++) {
-                if (mask & (1 << i)) bus->writeMPR(static_cast<u8>(i), a);
+                if (mask & (1 << i)) bus->writeMPR(static_cast<u8>(i), a, pc);
             }
             break;
         }
@@ -645,4 +672,23 @@ size_t HuC6280::dumpState(char* buf, size_t buf_size) const {
     return static_cast<size_t>(std::snprintf(buf, buf_size,
         "PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X SPD=%02X\n",
         pc, a, x, y, s, p, speed));
+}
+
+size_t HuC6280::getTrace(TraceEntry* out, size_t maxEntries) const {
+    if (!out || maxEntries == 0) return 0;
+    size_t n = traceCount < maxEntries ? traceCount : maxEntries;
+    // Oldest entry currently in the buffer is at traceHead (when full) or
+    // index 0 (when not yet full, since we haven't wrapped).
+    size_t start = (traceCount < kTraceSize) ? 0 : traceHead;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = trace[(start + i) % kTraceSize];
+    }
+    return n;
+}
+
+size_t HuC6280::getBootTrace(TraceEntry* out, size_t maxEntries) const {
+    if (!out || maxEntries == 0) return 0;
+    size_t n = bootTraceCount < maxEntries ? bootTraceCount : maxEntries;
+    for (size_t i = 0; i < n; i++) out[i] = bootTrace[i];
+    return n;
 }

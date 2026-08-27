@@ -81,6 +81,9 @@ void VDC::reset() {
     satbTransferPending = false;
     currentLine = 0;
     std::memset(videoCodes, 0, sizeof(videoCodes));
+    std::memset(regLog, 0, sizeof(regLog));
+    regLogHead = 0;
+    regLogCount = 0;
 }
 
 void VDC::runLine() {
@@ -332,7 +335,7 @@ uint8_t VDC::readRegister(u16 offset) {
     return 0xFF;   // write-only register read — open bus behavior assumed
 }
 
-void VDC::writeRegister(u16 offset, uint8_t val) {
+void VDC::writeRegister(u16 offset, uint8_t val, u16 debugPC) {
     bool isDataArea = (offset & 0x02) != 0;
 
     if (!isDataArea) {
@@ -351,8 +354,25 @@ void VDC::writeRegister(u16 offset, uint8_t val) {
         regs[ar] = static_cast<u16>((regs[ar] & 0xFF00) | val);
     } else {
         regs[ar] = static_cast<u16>((regs[ar] & 0x00FF) | (static_cast<u16>(val) << 8));
+        logRegWrite(debugPC, ar, regs[ar]);
         onHighByteWritten(ar);
     }
+}
+
+void VDC::logRegWrite(u16 pc, u8 regIndex, u16 value) {
+    regLog[regLogHead] = { pc, regIndex, value };
+    regLogHead = (regLogHead + 1) % kRegLogSize;
+    if (regLogCount < kRegLogSize) regLogCount++;
+}
+
+size_t VDC::getRegLog(RegLogEntry* out, size_t maxEntries) const {
+    if (!out || maxEntries == 0) return 0;
+    size_t n = regLogCount < maxEntries ? regLogCount : maxEntries;
+    size_t start = (regLogCount < kRegLogSize) ? 0 : regLogHead;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = regLog[(start + i) % kRegLogSize];
+    }
+    return n;
 }
 
 // ── side effects triggered by high-byte writes ──────────────────────────

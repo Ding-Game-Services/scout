@@ -103,6 +103,14 @@ DingResult ding_load_rom(const uint8_t* data, size_t len) {
     g_romIdentity.serial[0] = '\0';
     g_romIdentity.disc_id[0] = '\0';
 
+    // BUG FOUND (harness trace): if reset() runs before the ROM is loaded,
+    // the CPU's reset-vector fetch hits an empty cartridge (open bus,
+    // reads as 0xFF/0xFF) and latches PC=$FFFF, then stumbles through
+    // whatever real ROM bytes happen to follow once the ROM does load —
+    // never running actual boot code. Re-resetting here guarantees a
+    // correct reset-vector fetch regardless of caller call order.
+    g_engine.reset();
+
     return DING_OK;
 }
 
@@ -241,7 +249,21 @@ void ding_set_region(const char* region) {
 // ── Diagnostics ──────────────────────────────────────────────────────────
 
 size_t ding_diag_cpu_state(char* buf, size_t buf_size) {
-    return g_engine.cpu.dumpState(buf, buf_size);
+    size_t n = g_engine.cpu.dumpState(buf, buf_size);
+    if (n >= buf_size) return n;
+
+    // Appended here rather than a separate diag call — MPR banking is
+    // exactly the kind of thing that silently invalidates memory peeks
+    // if you don't know it at the same time (page 0 reads RAM only if
+    // MPR0 is banked to $F8; otherwise "zero page" is actually ROM).
+    int r = std::snprintf(buf + n, buf_size - n,
+        "MPR0=%02X MPR1=%02X MPR2=%02X MPR3=%02X MPR4=%02X MPR5=%02X MPR6=%02X MPR7=%02X\n",
+        g_engine.bus.readMPR(0), g_engine.bus.readMPR(1),
+        g_engine.bus.readMPR(2), g_engine.bus.readMPR(3),
+        g_engine.bus.readMPR(4), g_engine.bus.readMPR(5),
+        g_engine.bus.readMPR(6), g_engine.bus.readMPR(7));
+    if (r > 0) n += static_cast<size_t>(r);
+    return n;
 }
 
 size_t ding_diag_video_state(char* buf, size_t buf_size) {
@@ -250,6 +272,139 @@ size_t ding_diag_video_state(char* buf, size_t buf_size) {
 
 uint8_t ding_has_error() {
     return g_hasError;
+}
+
+// ── Extra diagnostics (not part of sdk/ding_core.h contract) ─────────────
+// Raw memory peek for harness debugging. Goes through Bus::read(), so it
+// respects MPR banking exactly like the CPU would see it — but note some
+// hardware-page reads have side effects (e.g. VDC's VRR auto-increment on
+// high-byte read). Safe for ROM/RAM peeking, use with care on $FF-bank
+// addresses.
+size_t ding_diag_read_memory(uint16_t addr, uint8_t* buf, size_t len) {
+    if (!buf) return 0;
+    for (size_t i = 0; i < len; i++) {
+        u16 wrapped = static_cast<u16>(addr + i);   // wrap at 64K like real CPU address space
+        buf[i] = g_engine.bus.read(static_cast<u32>(wrapped));
+    }
+    return len;
+}
+
+size_t ding_diag_trace(char* buf, size_t buf_size) {
+    HuC6280::TraceEntry entries[HuC6280::kTraceSize];
+    size_t n = g_engine.cpu.getTrace(entries, HuC6280::kTraceSize);
+
+    size_t written = 0;
+    for (size_t i = 0; i < n && written < buf_size; i++) {
+        int r = std::snprintf(buf + written, buf_size - written, "%04X:%02X ",
+            entries[i].pc, entries[i].opcode);
+        if (r <= 0) break;
+        written += static_cast<size_t>(r);
+    }
+    if (written < buf_size) buf[written] = '\0';
+    return written;
+}
+
+namespace {
+const char* vdcRegName(uint8_t idx) {
+    switch (idx) {
+        case 0x00: return "MAWR";
+        case 0x01: return "MARR";
+        case 0x02: return "VWR";
+        case 0x05: return "CR";
+        case 0x06: return "RCR";
+        case 0x07: return "BXR";
+        case 0x08: return "BYR";
+        case 0x09: return "MWR";
+        case 0x0A: return "HSR";
+        case 0x0B: return "HDR";
+        case 0x0C: return "VPR";
+        case 0x0D: return "VDR";
+        case 0x0E: return "VCR";
+        case 0x0F: return "DCR";
+        case 0x10: return "SOUR";
+        case 0x11: return "DESR";
+        case 0x12: return "LENR";
+        case 0x13: return "DVSSR";
+        default:   return "?";
+    }
+}
+} // namespace
+
+void ding_diag_add_watchpoint(uint16_t addr) {
+    g_engine.bus.addWatchpoint(addr);
+}
+
+void ding_diag_clear_watchpoints() {
+    g_engine.bus.clearWatchpoints();
+}
+
+size_t ding_diag_mpr_log(char* buf, size_t buf_size) {
+    Bus::MprLogEntry entries[Bus::kMprLogSize];
+    size_t n = g_engine.bus.getMprLog(entries, Bus::kMprLogSize);
+
+    size_t written = 0;
+    for (size_t i = 0; i < n && written < buf_size; i++) {
+        int r = std::snprintf(buf + written, buf_size - written, "[%04X]MPR%u=%02X ",
+            entries[i].pc, entries[i].index, entries[i].bank);
+        if (r <= 0) break;
+        written += static_cast<size_t>(r);
+    }
+    if (written < buf_size) buf[written] = '\0';
+    return written;
+}
+
+size_t ding_diag_watch_log(char* buf, size_t buf_size) {
+    Bus::WatchEntry entries[Bus::kWatchLogSize];
+    size_t n = g_engine.bus.getWatchLog(entries, Bus::kWatchLogSize);
+
+    size_t written = 0;
+    for (size_t i = 0; i < n && written < buf_size; i++) {
+        int r = std::snprintf(buf + written, buf_size - written, "[%04X]$%04X=%02X ",
+            entries[i].pc, entries[i].addr, entries[i].val);
+        if (r <= 0) break;
+        written += static_cast<size_t>(r);
+    }
+    if (written < buf_size) buf[written] = '\0';
+    return written;
+}
+
+size_t ding_diag_vdc_reg_log(char* buf, size_t buf_size) {
+    VDC::RegLogEntry entries[VDC::kRegLogSize];
+    size_t n = g_engine.vdc.getRegLog(entries, VDC::kRegLogSize);
+
+    size_t written = 0;
+    for (size_t i = 0; i < n && written < buf_size; i++) {
+        int r = std::snprintf(buf + written, buf_size - written, "[%04X]%s=%04X ",
+            entries[i].pc, vdcRegName(entries[i].regIndex), entries[i].value);
+        if (r <= 0) break;
+        written += static_cast<size_t>(r);
+    }
+    if (written < buf_size) buf[written] = '\0';
+    return written;
+}
+
+size_t ding_diag_boot_trace(char* buf, size_t buf_size) {
+    HuC6280::TraceEntry entries[HuC6280::kBootTraceSize];
+    size_t n = g_engine.cpu.getBootTrace(entries, HuC6280::kBootTraceSize);
+
+    size_t written = 0;
+    for (size_t i = 0; i < n && written < buf_size; i++) {
+        int r = std::snprintf(buf + written, buf_size - written, "%04X:%02X ",
+            entries[i].pc, entries[i].opcode);
+        if (r <= 0) break;
+        written += static_cast<size_t>(r);
+    }
+    if (written < buf_size) buf[written] = '\0';
+    return written;
+}
+
+size_t ding_diag_irq_state(char* buf, size_t buf_size) {
+    return static_cast<size_t>(std::snprintf(buf, buf_size,
+        "CLI_COUNT=%u IRQ2_ASSERT=%u IRQ2_SVC=%u IRQ1_ASSERT=%u IRQ1_SVC=%u TIQ_ASSERT=%u TIQ_SVC=%u\n",
+        g_engine.cpu.getCliCount(),
+        g_engine.irqController.getAssertCount(0), g_engine.irqController.getServiceCount(0),
+        g_engine.irqController.getAssertCount(1), g_engine.irqController.getServiceCount(1),
+        g_engine.irqController.getAssertCount(2), g_engine.irqController.getServiceCount(2)));
 }
 
 const char* ding_diag_last_error() {
